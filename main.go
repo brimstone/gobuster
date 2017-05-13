@@ -21,8 +21,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"github.com/satori/go.uuid"
-	"golang.org/x/crypto/ssh/terminal"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -35,6 +33,9 @@ import (
 	"sync"
 	"syscall"
 	"unicode/utf8"
+
+	"github.com/satori/go.uuid"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 // A single result which comes from an individual web
@@ -96,6 +97,7 @@ type State struct {
 	Terminate      bool
 	StdIn          bool
 	InsecureSSL    bool
+	Options        bool
 }
 
 type RedirectHandler struct {
@@ -168,9 +170,9 @@ func (set *IntSet) Stringify() string {
 	return strings.Join(values, ",")
 }
 
-// Make a request to the given URL.
-func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64) {
-	req, err := http.NewRequest("GET", fullUrl, nil)
+// Make an HTTP Request to the given URL
+func MakeRequest(s *State, method string, fullUrl, cookie string) (*http.Response, error) {
+	req, err := http.NewRequest(method, fullUrl, nil)
 
 	if err != nil {
 		return nil, nil
@@ -187,8 +189,14 @@ func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64) {
 	if s.Username != "" {
 		req.SetBasicAuth(s.Username, s.Password)
 	}
+	return s.Client.Do(req)
 
-	resp, err := s.Client.Do(req)
+}
+
+// Make a GET request to the given URL.
+func GetRequest(s *State, fullUrl, cookie string) (*int, *int64) {
+
+	resp, err := MakeRequest(s, "GET", fullUrl, cookie)
 
 	if err != nil {
 		if ue, ok := err.(*url.Error); ok {
@@ -226,7 +234,28 @@ func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64) {
 // Small helper to combine URL with URI then make a
 // request to the generated location.
 func GoGet(s *State, url, uri, cookie string) (*int, *int64) {
-	return MakeRequest(s, url+uri, cookie)
+	return GetRequest(s, url+uri, cookie)
+}
+
+// Make an OPTIONS request to the given URL.
+func OptionsRequest(s *State, fullUrl, cookie string) *[]string {
+	resp, err := MakeRequest(s, "OPTIONS", fullUrl, cookie)
+	if err != nil {
+		if ue, ok := err.(*url.Error); ok {
+
+			if strings.HasPrefix(ue.Err.Error(), "x509") {
+				fmt.Println("[-] Invalid certificate")
+			}
+
+			if _, ok := ue.Err.(*RedirectError); ok {
+				return nil
+			}
+		}
+		return nil
+	}
+
+	allow := resp.Header["Allow"]
+	return &allow
 }
 
 // Parse all the command line options into a settings
@@ -268,6 +297,7 @@ func ParseCmdLine() *State {
 	flag.BoolVar(&s.UseSlash, "f", false, "Append a forward-slash to each directory request (dir mode only)")
 	flag.BoolVar(&s.WildcardForced, "fw", false, "Force continued operation when wildcard found")
 	flag.BoolVar(&s.InsecureSSL, "k", false, "Skip SSL certificate verification")
+	flag.BoolVar(&s.Options, "opt", false, "Also check HTTP Options (dir mode only)")
 
 	flag.Parse()
 
@@ -609,11 +639,19 @@ func ProcessDirEntry(s *State, word string, resultChan chan<- Result) {
 	// Try the DIR first
 	dirResp, dirSize := GoGet(s, s.Url, word+suffix, s.Cookies)
 	if dirResp != nil {
-		resultChan <- Result{
+		result := Result{
 			Entity: word + suffix,
 			Status: *dirResp,
 			Size:   dirSize,
 		}
+		if s.Options {
+			options := OptionsRequest(s, s.Url+word+suffix, s.Cookies)
+			if options != nil {
+				result.Extra = strings.Join(*options, ", ")
+
+			}
+		}
+		resultChan <- result
 	}
 
 	// Follow up with files using each ext.
@@ -675,6 +713,9 @@ func PrintDirResult(s *State, r *Result) {
 
 		if r.Size != nil {
 			output += fmt.Sprintf(" [Size: %d]", *r.Size)
+		}
+		if r.Extra != "" {
+			output += fmt.Sprintf(" [Options: %s]", r.Extra)
 		}
 		output += "\n"
 
